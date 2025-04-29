@@ -95,13 +95,12 @@ class strava2gpx:
                     'Authorization': f'Bearer {self.access_token}'
                 }) as response:
                     if response.status != 200:
-                        raise Exception('Failed to get data stream for activity' + str(activity_id))
+                        raise Exception(f'Failed to get data stream for activity {activity_id}')
 
                     data = await response.json()
                     return data
         except Exception as e:
-            print('Error getting data streams:', str(e))
-            print('Error getting data streams:')
+            print(f'Error getting data streams: {e}')
             raise
 
     async def get_strava_activity(self, activity_id):
@@ -114,12 +113,12 @@ class strava2gpx:
                     'Authorization': f'Bearer {self.access_token}'
                 }) as response:
                     if response.status != 200:
-                        raise Exception('Failed to get activity')
+                        raise Exception('Failed to get activity: response status 200.')
 
                     data = await response.json()
                     return data
         except Exception as e:
-            print('Error getting activity:', str(e))
+            print(f'Error getting activity: {e}')
             raise
 
     async def detect_activity_streams(self, activity):
@@ -217,6 +216,6 @@ class strava2gpx:
                 await f.write(''.join(trkpts))
                 await f.write(gpx_content_end)
 
-            print('GPX file saved successfully.')
+            print(f'GPX file {output}.gpx saved successfully.')
         except Exception as err:
-            print('Error writing GPX file:', str(err))
+            print(f'Error writing GPX file: {err}')
