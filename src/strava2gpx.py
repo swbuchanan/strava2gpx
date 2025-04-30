@@ -2,14 +2,27 @@ import aiohttp
 import aiofiles
 import asyncio
 import os
+import logging
 
-class strava2gpx:
+logger = logging.getLogger(__name__)
+
+# (Elsewhere in your application setup, configure logging handlers/formatters,
+# e.g. logging.basicConfig(level=logging.INFO) or more advanced config.)
+
+
+class Strava2GPXError(Exception):
+    """Base exception for errors in Strava2GPX operations"""
+    pass # TODO: figure out what to do here
+
+class Strava2GPX:
     def __init__(self, client_id, client_secret, refresh_token):
         self.client_id = client_id
         self.client_secret = client_secret
         self.refresh_token = refresh_token
         self.access_token = None
         self.activities_list = None
+        # I guess it's better to reuse one session for all requests
+        self.session = aiohttp.ClientSession()
         self.streams = {
                         "latlng": 1, 
                         "altitude": 1, 
@@ -18,8 +31,8 @@ class strava2gpx:
                         "watts": 0, 
                         "temp": 0}
 
-    # Connects to the Strava API and gets the access token
     async def connect (self):
+        """Connect to Strava API and get the access token"""
         self.access_token = await self.refresh_access_token()
 
     # Gets a list of activities from Strava and stores them in self.activities_list
@@ -38,7 +51,8 @@ class strava2gpx:
             self.activities_list = masterlist
             return masterlist
     
-    async def refresh_access_token(self):
+    async def refresh_access_token(self) -> str:
+        """Fetch a new access token via OAuth refresh"""
         token_endpoint = 'https://www.strava.com/api/v3/oauth/token'
 
         form_data = {
@@ -47,6 +61,24 @@ class strava2gpx:
             'grant_type': 'refresh_token',
             'refresh_token': self.refresh_token
         }
+
+        try:
+            logger.debug("Requesting new access token from Strava")
+            resp = await self.session.post(token_endpoint, data=form_data)
+            resp.raise_for_status()
+        except aiohttp.ClientError as e:
+            logger.error("HTTP error during token refresh %s", e, exc_info=True)
+            raise Strava2GPXError("Failed to refresh access token") from e
+        
+        data = await resp.json()
+        token = data.get("access_token")
+        if not token:
+            logger.error("No access_token in response payload %r", data)
+            raise Strava2GPXError("Strava response missing access_token")
+        
+        logger.info("Successfully refreshed access token")
+        self.access_token = token
+        return token
 
         async with aiohttp.ClientSession() as session:
             try:
@@ -63,63 +95,139 @@ class strava2gpx:
                 print('Error refreshing access token:', str(e))
                 raise
 
-    async def get_strava_activities(self, page):
-        api_url = 'https://www.strava.com/api/v3/athlete/activities'
-        query_params = 'per_page=200'
+    async def get_strava_activities(self, page: int=1, per_page: int=200):
+        """Fetch a page of activities."""
+        if not self.access_token:
+            await self.refresh_access_token()
+
+        headers = {"Authorization": f"Bearer {self.access_token}"}
+        params = {"page": page, "per_page": per_page}
+        url = "https://www.strava.com/api/v3/athlete/activities"
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f'{api_url}?{query_params}&page={page}', headers={
-                    'Authorization': f'Bearer {self.access_token}'
-                }) as response:
-                    if response.status != 200:
-                        raise Exception('Failed to get activities')
+            logger.debug("Fetching activities page=%d per_page=%d", page, per_page)
+            resp = await self.session.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+        except aiohttp.ClientResponseError as e:
+            logger.error(
+                "Strava API returned %d for activities: %s", e.status, e.message, exc_info=True
+            )
+            raise Strava2GPXError(f"Failed to fetch activities (status {e.status})") from e
+        except aiohttp.ClientError as e:
+            logger.error("Network error fetching activities: %s", e, exc_info=True)
+            raise Strava2GPXError("Network error when fetching activities") from e
 
-                    data = await response.json()
-                    return data
-        except Exception as e:
-            print('Error getting activities:', str(e))
-            raise
+        activities = await resp.json()
+        logger.info("Retrieved %d activities on page %d", len(activities), page)
+        return activities
 
     async def get_data_stream(self, activity_id):
+        """Get the data stream from one activity"""
+
         api_url = f'https://www.strava.com/api/v3/activities/{activity_id}/streams'
         query_params = 'time'
+        headers = {
+            'Authorization': f"Bearer {self.access_token}"
+        }
+
+        # check to see which streams we should be getting
         for key, value in self.streams.items():
             if value == 1:
                 query_params += f',{key}'
         url = f'{api_url}?keys={query_params}&key_by_type=true'
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={
-                    'Authorization': f'Bearer {self.access_token}'
-                }) as response:
-                    if response.status != 200:
-                        raise Exception(f'Failed to get data stream for activity {activity_id}')
+            logger.debug("GET %s → headers=%r", url, headers)
+            async with self.session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                logger.info(
+                    "Retrieved %d streams for activity %d",
+                    len(data), activity_id
+                )
+                return data
 
-                    data = await response.json()
-                    return data
-        except Exception as e:
-            print(f'Error getting data streams: {e}')
-            raise
+        except aiohttp.ClientResponseError as e:
+            logger.error(
+                "Strava API error %s for activity %d streams: %s",
+                e.status, activity_id, e.message, exc_info=True
+            )
+            raise Strava2GPXError(
+                f"Failed to fetch data streams for activity {activity_id} (HTTP {e.status})"
+            ) from e
+
+        except aiohttp.ClientError as e:
+            logger.error(
+                "Network error fetching streams for activity %d: %s",
+                activity_id, e, exc_info=True
+            )
+            raise Strava2GPXError(
+                f"Network error when fetching data streams for activity {activity_id}"
+            ) from e
+
+        # try:
+        #     async with aiohttp.ClientSession() as session:
+        #         async with session.get(url, headers={
+        #             'Authorization': f'Bearer {self.access_token}'
+        #         }) as response:
+        #             if response.status != 200:
+        #                 raise Exception(f'Failed to get data stream for activity {activity_id}')
+
+        #             data = await response.json()
+        #             return data
+        # except Exception as e:
+        #     print(f'Error getting data streams: {e}')
+        #     raise
 
     async def get_strava_activity(self, activity_id):
         api_url = 'https://www.strava.com/api/v3/activities/'
         url = f'{api_url}{activity_id}?include_all_efforts=false'
+        headers = {
+            'Authorization': f"Bearer {self.access_token}"
+        }
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers={
-                    'Authorization': f'Bearer {self.access_token}'
-                }) as response:
-                    if response.status != 200:
-                        raise Exception('Failed to get activity: response status 200.')
+            logger.debug("GET %s -> headers=%r", url, headers)
+            async with self.session.get(url, headers=headers) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                logger.info(
+                    "Retrieved data for activity %d",
+                    activity_id
+                )
+                return data
+            
+        except aiohttp.ClientResponseError as e:
+            logger.error(
+                "Strava API error %d when fetching activity %d: %s", 
+                e.status, activity_id, e.message, exc_info=True
+            )
+            raise Strava2GPXError(
+                f"Failed to fetch data for activity {activity_id} (HTTP {e.status})"
+            ) from e
 
-                    data = await response.json()
-                    return data
-        except Exception as e:
-            print(f'Error getting activity: {e}')
-            raise
+        except aiohttp.ClientError as e:
+            logger.error(
+                "Network error when fetching data for activity %d: %s", 
+                activity_id, e, exc_info=True
+            )
+            raise Strava2GPXError(
+                f"Network error fetching data for activity {activity_id}"
+            ) from e
+
+        # try:
+        #     async with aiohttp.ClientSession() as session:
+        #         async with session.get(url, headers={
+        #             'Authorization': f'Bearer {self.access_token}'
+        #         }) as response:
+        #             if response.status != 200:
+        #                 raise Exception('Failed to get activity: response status 200.')
+
+        #             data = await response.json()
+        #             return data
+        # except Exception as e:
+        #     print(f'Error getting activity: {e}')
+        #     raise
 
     async def detect_activity_streams(self, activity):
         if activity.get('device_watts', False):
